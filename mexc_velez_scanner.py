@@ -4,17 +4,18 @@ import requests
 import pandas as pd
 from datetime import datetime, timezone
 
-# Reads securely from GitHub Secrets
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
+# Scanner Settings
 MIN_24H_TURNOVER_USDT = 50_000_000  # Minimum $50M 24h volume
-MAX_ABS_FUNDING_RATE = 0.0005       # 0.05% max funding rate
-BASE_URL = "https://mexc.com"
+SCAN_TOP_N_COINS = 35               # Scan top 35 highest-volume perpetuals
+OKX_BASE_URL = "https://okx.com"
 
 
 def send_telegram_alert(message: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID secret!")
         print(message)
         return
 
@@ -26,72 +27,83 @@ def send_telegram_alert(message: str):
         "disable_web_page_preview": True,
     }
     try:
-        requests.post(url, json=payload, timeout=10)
+        r = requests.post(url, json=payload, timeout=10)
+        if r.status_code != 200:
+            print(f"Telegram API error ({r.status_code}): {r.text}")
     except Exception as e:
-        print(f"Telegram error: {e}")
+        print(f"Telegram connection error: {e}")
 
 
 def get_liquid_symbols():
-    resp = requests.get(f"{BASE_URL}/ticker", timeout=10).json()
-    if not resp.get("success"):
+    """Fetches high-volume USDT perpetual swaps from OKX public market API."""
+    url = f"{OKX_BASE_URL}/market/tickers"
+    resp = requests.get(url, params={"instType": "SWAP"}, timeout=15)
+    if resp.status_code != 200:
+        print(f"API HTTP error {resp.status_code}: {resp.text[:200]}")
+        return []
+
+    payload = resp.json()
+    if payload.get("code") != "0":
+        print(f"API response error: {payload}")
         return []
 
     liquid_pairs = []
-    for item in resp.get("data", []):
-        symbol = item.get("symbol", "")
-        turnover = float(item.get("amount24", 0))
-        funding = float(item.get("fundingRate", 0))
-        last_price = float(item.get("lastPrice", 0))
+    for item in payload.get("data", []):
+        inst_id = item.get("instId", "")  # Format: BTC-USDT-SWAP
+        if not inst_id.endswith("-USDT-SWAP"):
+            continue
 
-        if symbol.endswith("_USDT") and turnover >= MIN_24H_TURNOVER_USDT:
+        vol_ccy_24h = float(item.get("volCcy24h", 0))  # Volume in base coin
+        last_price = float(item.get("last", 0))
+        turnover_usdt = vol_ccy_24h * last_price
+
+        if turnover_usdt >= MIN_24H_TURNOVER_USDT:
+            base_coin = inst_id.split("-")[0]
+            mexc_symbol = f"{base_coin}_USDT"
             liquid_pairs.append({
-                "symbol": symbol,
-                "turnover": turnover,
-                "funding": funding,
+                "inst_id": inst_id,
+                "mexc_symbol": mexc_symbol,
+                "turnover": turnover_usdt,
                 "last_price": last_price,
             })
 
     liquid_pairs.sort(key=lambda x: x["turnover"], reverse=True)
-    return liquid_pairs
+    return liquid_pairs[:SCAN_TOP_N_COINS]
 
 
-def get_klines(symbol: str, interval: str, limit: int = 220) -> pd.DataFrame:
-    interval_seconds = {
-        "Min5": 300,
-        "Hour1": 3600,
-        "Hour4": 14400,
-    }[interval]
-
-    end_ts = int(time.time())
-    start_ts = end_ts - (limit * interval_seconds)
-
-    resp = requests.get(
-        f"{BASE_URL}/kline/{symbol}",
-        params={"interval": interval, "start": start_ts, "end": end_ts},
-        timeout=10,
-    ).json()
-
-    if not resp.get("success") or not resp.get("data"):
+def get_klines(inst_id: str, bar: str, limit: int = 220) -> pd.DataFrame:
+    """Fetches historical candlesticks (bar: '5m', '1H', '4H')."""
+    url = f"{OKX_BASE_URL}/market/candles"
+    params = {"instId": inst_id, "bar": bar, "limit": str(limit)}
+    resp = requests.get(url, params=params, timeout=15)
+    if resp.status_code != 200:
         return pd.DataFrame()
 
-    data = resp["data"]
-    df = pd.DataFrame({
-        "time": data["time"],
-        "open": pd.to_numeric(data["open"], errors="coerce"),
-        "high": pd.to_numeric(data["high"], errors="coerce"),
-        "low": pd.to_numeric(data["low"], errors="coerce"),
-        "close": pd.to_numeric(data["close"], errors="coerce"),
-        "vol": pd.to_numeric(data["vol"], errors="coerce"),
-    })
+    payload = resp.json()
+    rows = payload.get("data", [])
+    if payload.get("code") != "0" or not rows:
+        return pd.DataFrame()
+
+    # OKX returns newest candle first; reverse to chronological order
+    rows.reverse()
+
+    df = pd.DataFrame(rows, columns=[
+        "ts", "open", "high", "low", "close", "vol", "volCcy", "volCcyQuote", "confirm"
+    ])
+
+    df["time"] = pd.to_numeric(df["ts"], errors="coerce") / 1000.0
+    for col in ["open", "high", "low", "close", "vol"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
     df["sma20"] = df["close"].rolling(20).mean()
     df["sma200"] = df["close"].rolling(200).mean()
     return df
 
 
-def check_higher_timeframes(symbol: str):
-    df_4h = get_klines(symbol, "Hour4", limit=220)
-    df_1h = get_klines(symbol, "Hour1", limit=220)
+def check_higher_timeframes(inst_id: str):
+    """Checks 4H and 1H alignment for BULLISH or BEARISH bias."""
+    df_4h = get_klines(inst_id, "4H", limit=220)
+    df_1h = get_klines(inst_id, "1H", limit=220)
 
     if len(df_4h) < 205 or len(df_1h) < 205:
         return None
@@ -121,8 +133,9 @@ def check_higher_timeframes(symbol: str):
     return None
 
 
-def analyze_5m_setup(symbol: str, bias: str):
-    df = get_klines(symbol, "Min5", limit=220)
+def analyze_5m_setup(inst_id: str, bias: str):
+    """Scans 5M chart for Velez Elephant Bar 200 SMA Breakouts or 20 SMA Pullbacks."""
+    df = get_klines(inst_id, "5m", limit=220)
     if len(df) < 205:
         return None
 
@@ -136,7 +149,7 @@ def analyze_5m_setup(symbol: str, bias: str):
     if bar["range"] == 0 or pd.isna(bar["sma200"]):
         return None
 
-    # Ensure the closed candle is fresh (closed within the last 6 minutes)
+    # Ensure the closed candle is fresh (within the last 11 minutes)
     if (time.time() - bar["time"]) > 660:
         return None
 
@@ -169,36 +182,35 @@ def analyze_5m_setup(symbol: str, bias: str):
 def run_single_scan():
     utc_now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     pairs = get_liquid_symbols()
-    print(f"[{utc_now}] Scanning {len(pairs)} liquid MEXC pairs...")
+    print(f"[{utc_now}] Scanning top {len(pairs)} liquid perpetual pairs...")
 
+    matches = 0
     for pair in pairs:
-        symbol = pair["symbol"]
-        funding = pair["funding"]
+        inst_id = pair["inst_id"]
+        mexc_symbol = pair["mexc_symbol"]
 
-        bias = check_higher_timeframes(symbol)
+        bias = check_higher_timeframes(inst_id)
         if not bias:
             continue
 
-        if bias == "LONG" and funding > MAX_ABS_FUNDING_RATE:
-            continue
-        if bias == "SHORT" and funding < -MAX_ABS_FUNDING_RATE:
-            continue
-
-        setup_name = analyze_5m_setup(symbol, bias)
+        setup_name = analyze_5m_setup(inst_id, bias)
         if setup_name:
-            mexc_link = f"https://mexc.com{symbol}"
+            matches += 1
+            print(f"MATCH: {mexc_symbol} -> {setup_name}")
+            mexc_link = f"https://mexc.com{mexc_symbol}"
             msg = (
-                f"<b>VELEZ SETUP DETECTED: {symbol}</b>\n"
+                f"<b>VELEZ SETUP DETECTED: {mexc_symbol}</b>\n"
                 f"<b>Setup:</b> {setup_name}\n"
                 f"<b>HTF Bias (4H & 1H):</b> {bias}\n"
                 f"<b>Price:</b> ${pair['last_price']}\n"
                 f"<b>24h Vol:</b> ${pair['turnover']:,.0f}\n"
-                f"<b>Funding:</b> {funding * 100:.4f}%\n"
                 f"<a href='{mexc_link}'>Open Chart on MEXC</a>"
             )
             send_telegram_alert(msg)
 
-        time.sleep(0.2)
+        time.sleep(0.15)
+
+    print(f"Scan finished cleanly. Total setups found: {matches}")
 
 
 if __name__ == "__main__":
